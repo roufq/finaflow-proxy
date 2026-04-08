@@ -2,66 +2,95 @@ export const config = {
   runtime: 'edge',
 };
 
+// Pastikan URL ini sudah benar dan tanpa tanda miring (/) di akhir
 const WEBSITE_URL = "https://finaflow.gt.tc";
 
 export default async function handler(request) {
   const url = new URL(request.url);
-  // Membersihkan path agar mudah dibaca
   const pathParts = url.pathname.split('/').filter(p => p !== ""); 
 
   /**
    * A. INBOUND: Telegram -> Vercel -> Laravel (FinaFlow)
-   * Pola URL: https://project-p5vrt.vercel.app/bot-webhook-jembatan/[TOKEN]
+   * Terjadi saat user mengirim pesan ke Bot Telegram
    */
   if (pathParts[0] === "bot-webhook-jembatan") {
     const userWebhookToken = pathParts[1];
 
     if (!userWebhookToken) {
-      return new Response("Error: Token Webhook tidak ditemukan.", { status: 400 });
+      console.error("Inbound Error: User Token missing in URL");
+      return new Response("Error: Token missing", { status: 400 });
     }
 
     const targetUrl = `${WEBSITE_URL}/telegram/webhook/${userWebhookToken}`;
     
-    // Kloning request agar body bisa dibaca tanpa merusak stream asli
-    const clonedRequest = request.clone();
-    const body = await clonedRequest.arrayBuffer();
+    try {
+      // Cloning request untuk membaca body JSON tanpa merusak stream asli
+      const clonedRequest = request.clone();
+      const body = await clonedRequest.arrayBuffer();
 
-    return fetch(targetUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        // User-Agent browser asli untuk mengelabui firewall Anti-Bot InfinityFree
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-      },
-      body: body,
-    });
+      console.log(`Forwarding message to Laravel: ${targetUrl}`);
+
+      const response = await fetch(targetUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json",
+          // Menyamar sebagai browser untuk bypass Anti-Bot InfinityFree
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        },
+        body: body,
+      });
+
+      const resText = await response.text();
+      console.log(`Laravel Response Status: ${response.status}`);
+      console.log(`Laravel Response Body: ${resText}`);
+
+      return new Response(resText, { 
+        status: response.status,
+        headers: { "Content-Type": "application/json" }
+      });
+
+    } catch (err) {
+      console.error("Inbound Fetch Error:", err.message);
+      return new Response("Bridge Error: " + err.message, { status: 500 });
+    }
   }
 
   /**
-   * B. OUTBOUND: Laravel (FinaFlow) -> Vercel -> api.telegram.org
-   * Ini digunakan saat Laravel ingin membalas pesan (sendMessage, dll)
+   * B. OUTBOUND: Laravel (FinaFlow) -> Vercel -> Telegram
+   * Terjadi saat Laravel mengirim perintah 'sendMessage' ke Telegram
    */
   const cleanPath = url.pathname === "/" ? "" : url.pathname;
   const finalTgUrl = `https://api.telegram.org${cleanPath}${url.search}`;
 
-  // Salin header asli dari Laravel
-  const newHeaders = new Headers(request.headers);
-  // Hapus header 'host' agar tidak ditolak oleh server Telegram
-  newHeaders.delete("host");
-  newHeaders.set("User-Agent", "FinaFlow-Bridge/2.0");
+  try {
+    const newHeaders = new Headers(request.headers);
+    newHeaders.delete("host");
+    newHeaders.set("User-Agent", "FinaFlow-Bridge/3.0");
 
-  // Siapkan opsi fetch untuk outbound
-  const fetchOptions = {
-    method: request.method,
-    headers: newHeaders,
-  };
+    const fetchOptions = {
+      method: request.method,
+      headers: newHeaders,
+      redirect: 'follow'
+    };
 
-  // Jika bukan GET, sertakan body (untuk sendMessage, dll)
-  if (request.method !== 'GET' && request.method !== 'HEAD') {
-    const outboundCloned = request.clone();
-    fetchOptions.body = await outboundCloned.arrayBuffer();
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      const outboundCloned = request.clone();
+      fetchOptions.body = await outboundCloned.arrayBuffer();
+    }
+
+    console.log(`Proxying request to Telegram: ${finalTgUrl}`);
+
+    const tgResponse = await fetch(finalTgUrl, fetchOptions);
+    const tgResBody = await tgResponse.arrayBuffer();
+
+    return new Response(tgResBody, {
+      status: tgResponse.status,
+      headers: tgResponse.headers
+    });
+
+  } catch (err) {
+    console.error("Outbound Proxy Error:", err.message);
+    return new Response("Telegram Proxy Error: " + err.message, { status: 502 });
   }
-
-  return fetch(finalTgUrl, fetchOptions);
 }
