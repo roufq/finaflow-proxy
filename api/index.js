@@ -1,38 +1,67 @@
-const WEBSITE_URL = "https://finaflow.gt.tc"; // URL Website Utama Anda
+export const config = {
+  runtime: 'edge',
+};
 
-export default {
-  async fetch(request) {
-    const url = new URL(request.url);
-    const pathParts = url.pathname.split('/');
+const WEBSITE_URL = "https://finaflow.gt.tc";
 
-    // A. INBOUND: Telegram -> Worker -> FinaFlow (Jembatan Masuk)
-    // Pola URL: https://worker-anda.com/bot-webhook-jembatan/{USER_TOKEN}
-    if (pathParts[1] === "bot-webhook-jembatan") {
-      const userWebhookToken = pathParts[2]; // Mengambil token dari URL secara dinamis
+export default async function handler(request) {
+  const url = new URL(request.url);
+  // Membersihkan path agar mudah dibaca
+  const pathParts = url.pathname.split('/').filter(p => p !== ""); 
 
-      if (!userWebhookToken) {
-        return new Response("Error: Webhook Token tidak ditemukan di URL.", { status: 400 });
-      }
+  /**
+   * A. INBOUND: Telegram -> Vercel -> Laravel (FinaFlow)
+   * Pola URL: https://project-p5vrt.vercel.app/bot-webhook-jembatan/[TOKEN]
+   */
+  if (pathParts[0] === "bot-webhook-jembatan") {
+    const userWebhookToken = pathParts[1];
 
-      const targetUrl = `${WEBSITE_URL}/telegram/webhook/${userWebhookToken}`;
-
-      return fetch(targetUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", // Agar lolos blokir hosting
-        },
-        body: request.body,
-      });
+    if (!userWebhookToken) {
+      return new Response("Error: Token Webhook tidak ditemukan.", { status: 400 });
     }
 
-    // B. OUTBOUND: FinaFlow -> Worker -> api.telegram.org (Proxy Keluar)
-    // Bagian ini sudah otomatis fleksibel karena token bot asli dikirim dalam URL dari website
-    url.hostname = "api.telegram.org";
-    return fetch(url.toString(), {
-      method: request.method,
-      headers: request.headers,
-      body: request.body,
+    const targetUrl = `${WEBSITE_URL}/telegram/webhook/${userWebhookToken}`;
+    
+    // Kloning request agar body bisa dibaca tanpa merusak stream asli
+    const clonedRequest = request.clone();
+    const body = await clonedRequest.arrayBuffer();
+
+    return fetch(targetUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        // User-Agent browser asli untuk mengelabui firewall Anti-Bot InfinityFree
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      },
+      body: body,
     });
-  },
-};
+  }
+
+  /**
+   * B. OUTBOUND: Laravel (FinaFlow) -> Vercel -> api.telegram.org
+   * Ini digunakan saat Laravel ingin membalas pesan (sendMessage, dll)
+   */
+  const cleanPath = url.pathname === "/" ? "" : url.pathname;
+  const finalTgUrl = `https://api.telegram.org${cleanPath}${url.search}`;
+
+  // Salin header asli dari Laravel
+  const newHeaders = new Headers(request.headers);
+  // Hapus header 'host' agar tidak ditolak oleh server Telegram
+  newHeaders.delete("host");
+  newHeaders.set("User-Agent", "FinaFlow-Bridge/2.0");
+
+  // Siapkan opsi fetch untuk outbound
+  const fetchOptions = {
+    method: request.method,
+    headers: newHeaders,
+  };
+
+  // Jika bukan GET, sertakan body (untuk sendMessage, dll)
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    const outboundCloned = request.clone();
+    fetchOptions.body = await outboundCloned.arrayBuffer();
+  }
+
+  return fetch(finalTgUrl, fetchOptions);
+}
